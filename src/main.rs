@@ -4,7 +4,7 @@ use {
     hickory_proto::{
         op::{Edns, Header, ResponseCode},
         rr::{
-            rdata::{A, AAAA, CNAME, NS, SOA, TXT},
+            rdata::{A, AAAA, CNAME, NS, PTR, SOA, TXT},
             Name, RData, Record, RecordType,
         },
     },
@@ -173,7 +173,8 @@ impl DnsProxy {
             | RecordType::CNAME
             | RecordType::NS
             | RecordType::SOA
-            | RecordType::TXT => {
+            | RecordType::TXT
+            | RecordType::PTR => {
                 let dns_entity = self
                     .get_dns_entity(
                         &quest.name().to_utf8(),
@@ -213,6 +214,10 @@ impl DnsProxy {
                                         )),
                                     )
                                 }
+                                12 => (
+                                    RecordType::PTR,
+                                    RData::PTR(PTR(Name::from_str(&answer.data)?)),
+                                ),
                                 16 => (RecordType::TXT, RData::TXT(TXT::new(vec![answer.data]))),
                                 28 => {
                                     (RecordType::AAAA, RData::AAAA(AAAA::from_str(&answer.data)?))
@@ -280,6 +285,7 @@ async fn main() {
     let mut server = hickory_server::ServerFuture::new(dns_handler);
     server.register_socket(socket);
     server.register_listener(TcpListener::bind(bind_addr).await.unwrap(), timeout);
+
     let _ = server.block_until_done().await;
 }
 
