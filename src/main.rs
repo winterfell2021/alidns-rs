@@ -19,7 +19,7 @@ use {
     sha2::{Digest, Sha256},
     std::{
         io,
-        net::{Ipv4Addr, SocketAddr},
+        net::SocketAddr,
         str::FromStr,
         time::{SystemTime, UNIX_EPOCH},
     },
@@ -91,8 +91,8 @@ struct Args {
     server: String,
 
     /// Listening address and port
-    #[arg(short, long, default_value_t = 16883)]
-    port: u16,
+    #[arg(short, long, default_value = "127.0.0.1:16883")]
+    listen: String,
 }
 #[derive(Clone, Debug)]
 struct DnsProxy {
@@ -166,7 +166,6 @@ impl DnsProxy {
     }
 
     fn extract_address(input: &str) -> Option<String> {
-        tracing::info!("{}", input);
         input
             .split(',')
             .map(|part| part.trim())
@@ -308,7 +307,7 @@ async fn main() {
         args.access_key_secret,
         args.timeout,
     );
-    let bind_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), args.port);
+    let bind_addr: SocketAddr = SocketAddr::from_str(&args.listen).unwrap();
     let socket = UdpSocket::bind(bind_addr).await.unwrap();
     let dns_handler = DnsHandler::new(helper);
     let mut server = hickory_server::ServerFuture::new(dns_handler);
