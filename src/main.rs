@@ -4,7 +4,10 @@ use {
     hickory_proto::{
         op::{Edns, Header, ResponseCode},
         rr::{
-            rdata::{A, AAAA, CNAME, NS, PTR, SOA, TXT},
+            rdata::{
+                opt::{EdnsCode, EdnsOption},
+                A, AAAA, CNAME, NS, PTR, SOA, TXT,
+            },
             Name, RData, Record, RecordType,
         },
     },
@@ -126,7 +129,7 @@ impl DnsProxy {
         &self,
         name: &str,
         rtype: &str,
-        ecs: Option<&str>,
+        ecs: Option<String>,
     ) -> anyhow::Result<Option<DNSEntity>> {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -147,7 +150,7 @@ impl DnsProxy {
 
         if let Some(ecs) = ecs {
             if !ecs.trim().is_empty() {
-                url += &format!("&edns_client_subnet={}", ecs);
+                url += &format!("&edns_client_subnet={}/24", ecs);
             }
         }
 
@@ -162,11 +165,37 @@ impl DnsProxy {
         Ok(sonic_rs::from_str::<DNSEntity>(&text).ok())
     }
 
+    fn extract_address(input: &str) -> Option<String> {
+        tracing::info!("{}", input);
+        input
+            .split(',')
+            .map(|part| part.trim())
+            .find(|&part| part.starts_with("C"))
+            .and_then(|addr_part| addr_part.split_whitespace().last())
+            .and_then(|addr| Some(addr.to_string()))
+    }
+
     async fn get_response(
         &self,
         request: &Request,
     ) -> anyhow::Result<(Vec<Record>, Vec<Record>, Vec<Record>, Vec<Record>)> {
         let quest = request.request_info().query.original().clone();
+        let edns: Option<String> = match request.edns() {
+            Some(edns) => {
+                let opt: Option<&EdnsOption> = edns.option(EdnsCode::Subnet);
+                if let Some(opt) = opt {
+                    if let EdnsOption::Subnet(client_subnet) = opt {
+                        Self::extract_address(&format!("{:?}", client_subnet))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+
         match quest.query_type() {
             RecordType::A
             | RecordType::AAAA
@@ -179,7 +208,7 @@ impl DnsProxy {
                     .get_dns_entity(
                         &quest.name().to_utf8(),
                         &quest.query_type().to_string(),
-                        None,
+                        edns,
                     )
                     .await?;
                 if let Some(dns_entity) = dns_entity {
