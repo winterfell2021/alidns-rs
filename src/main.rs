@@ -1,6 +1,7 @@
 use {
     anyhow::anyhow,
     clap::{command, Parser},
+    faststr::FastStr,
     hickory_proto::{
         op::{Edns, Header, ResponseCode},
         rr::{
@@ -15,12 +16,15 @@ use {
         authority::{MessageResponse, MessageResponseBuilder},
         server::{Request, RequestHandler, ResponseHandler, ResponseInfo},
     },
+    idna::domain_to_ascii,
+    rand::prelude::SliceRandom,
     serde::{Deserialize, Serialize},
     sha2::{Digest, Sha256},
     std::{
         io,
         net::SocketAddr,
         str::FromStr,
+        sync::LazyLock,
         time::{SystemTime, UNIX_EPOCH},
     },
     tokio::{
@@ -29,6 +33,30 @@ use {
     },
     tracing_subscriber::EnvFilter,
 };
+
+const SERVER: LazyLock<Vec<FastStr>> = LazyLock::new(|| {
+    ["223.5.5.5", "223.6.6.6"]
+        .iter()
+        .map(|x| FastStr::new(x))
+        .collect()
+});
+#[macro_export]
+macro_rules! formatx {
+    ($($arg:expr),*) => {{
+        let mut s = String::new();
+        $(_formatx_internal!(s, $arg);)*
+        s
+    }};
+}
+
+macro_rules! _formatx_internal {
+    ($s:expr, $arg:expr) => {{
+        $s.push_str(&format!("{}", $arg));
+    }};
+    ($s:expr, $arg:literal) => {{
+        $s.push_str($arg);
+    }};
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Answer {
@@ -88,34 +116,52 @@ struct Args {
 
     /// Server address to set
     #[arg(short, long, default_value = "223.5.5.5")]
-    server: String,
+    server: FastStr,
 
     /// Listening address and port
     #[arg(short, long, default_value = "127.0.0.1:16883")]
     listen: String,
+
+    #[arg(short, long, default_value_t = false)]
+    rand: bool,
+
+    // use https
+    #[arg(long, default_value_t = false)]
+    https: bool,
+
+    // use http2
+    #[arg(long, default_value_t = false)]
+    http2: bool,
 }
+
 #[derive(Clone, Debug)]
 struct DnsProxy {
-    server: String,
+    server: FastStr,
     account_id: String,
     access_key_id: String,
     access_key_secret: String,
-    timeout: u64,
+    rand: bool,
+    https: bool,
+    http2: bool,
 }
 impl DnsProxy {
     fn new(
-        server: String,
+        server: FastStr,
         account_id: String,
         access_key_id: String,
         access_key_secret: String,
-        timeout: u64,
+        rand: bool,
+        https: bool,
+        http2: bool,
     ) -> Self {
         DnsProxy {
             server,
             account_id,
             access_key_id,
             access_key_secret,
-            timeout,
+            rand,
+            https,
+            http2,
         }
     }
 
@@ -125,6 +171,49 @@ impl DnsProxy {
         Ok(header.into())
     }
 
+    fn server(&self) -> FastStr {
+        if self.rand {
+            SERVER.choose(&mut rand::thread_rng()).unwrap().clone()
+        } else {
+            self.server.clone()
+        }
+    }
+    fn build_url(
+        &self,
+        name: &str,
+        rtype: &str,
+        key: &str,
+        ts: &str,
+        ecs: Option<String>,
+    ) -> String {
+        let mut url: String = String::new();
+        if self.https || self.http2 {
+            url.push_str("https://");
+        } else {
+            url.push_str("http://");
+        }
+        url.push_str(&formatx!(
+            &self.server(),
+            "/resolve?name=",
+            name,
+            "&type=",
+            rtype,
+            "&uid=",
+            self.account_id,
+            "&ak=",
+            self.access_key_id,
+            "&key=",
+            key,
+            "&ts=",
+            ts
+        ));
+        if let Some(ecs) = ecs {
+            if !ecs.trim().is_empty() {
+                url.push_str(&formatx!("&edns_client_subnet=", ecs, "/24"));
+            }
+        }
+        url
+    }
     async fn get_dns_entity(
         &self,
         name: &str,
@@ -136,6 +225,11 @@ impl DnsProxy {
             .unwrap()
             .as_secs()
             .to_string();
+        let name = if name.chars().any(|c| !c.is_ascii()) {
+            domain_to_ascii(name).map_err(|_| anyhow!("Invalid domain name"))?
+        } else {
+            name.to_string()
+        };
         let mut hasher = Sha256::new();
         hasher.update(format!(
             "{}{}{}{}{}",
@@ -143,23 +237,18 @@ impl DnsProxy {
         ));
         let key: String = format!("{:X}", hasher.finalize());
 
-        let mut url = format!(
-            "http://{}/resolve?name={}&type={}&uid={}&ak={}&key={}&ts={}",
-            self.server, name, rtype, self.account_id, self.access_key_id, key, ts
-        );
+        let url = self.build_url(&name, rtype, &key, &ts, ecs);
 
-        if let Some(ecs) = ecs {
-            if !ecs.trim().is_empty() {
-                url += &format!("&edns_client_subnet={}/24", ecs);
-            }
+        let mut builder = reqwest::Client::builder();
+        if self.http2 {
+            builder = builder.use_rustls_tls();
         }
-
-        let client = reqwest::Client::new();
-        let response = client
-            .get(&url)
-            // .header("User-Agent", "ArashiDNS.Aha/0.1")
-            .send()
-            .await?;
+        let client = builder.build()?;
+        let mut builder = client.get(&url);
+        if self.http2 {
+            builder = builder.version(reqwest::Version::HTTP_2);
+        }
+        let response = builder.send().await?;
         let text = response.text().await?;
         tracing::info!("[ali_response]: {}", text);
         Ok(sonic_rs::from_str::<DNSEntity>(&text).ok())
@@ -282,8 +371,7 @@ impl DnsProxy {
                 return Err(anyhow!("No DNS entity found"));
             }
             _ => {
-                tracing::info!("unsupport query type: {:?}", quest.query_type());
-                return Err(anyhow!("No DNS entity found"));
+                return Err(anyhow!("unsupport query type: {:?}", quest.query_type()));
             }
         }
     }
@@ -305,7 +393,9 @@ async fn main() {
         args.account_id,
         args.access_key_id,
         args.access_key_secret,
-        args.timeout,
+        args.rand,
+        args.https,
+        args.http2,
     );
     let bind_addr: SocketAddr = SocketAddr::from_str(&args.listen).unwrap();
     let socket = UdpSocket::bind(bind_addr).await.unwrap();
@@ -381,11 +471,13 @@ mod tests {
     #[tokio::test]
     async fn test_get_dns_entity() {
         let helper = DnsProxy::new(
-            "127.0.0.1:8053".to_string(),
+            "127.0.0.1:8053".into(),
             "your_account_id".to_string(),
             "your_access_key_id".to_string(),
             "your_access_key_secret".to_string(),
-            5000,
+            false,
+            false,
+            false,
         );
         let res = helper
             .get_dns_entity("www.baidu.com", &RecordType::A.to_string(), None)
