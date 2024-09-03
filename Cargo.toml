@@ -8,7 +8,6 @@ anyhow = "1.0.86"
 async-trait = "0.1.82"
 clap = { version = "4.5.16", features = ["derive"] }
 faststr = "0.2.22"
-hickory-client = "0.24.1"
 hickory-proto = "0.24.1"
 hickory-server = "0.24.1"
 idna = "1.0.2"

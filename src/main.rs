@@ -7,10 +7,11 @@ use {
         rr::{
             rdata::{
                 opt::{EdnsCode, EdnsOption},
-                A, AAAA, CNAME, NS, PTR, SOA, TXT,
+                A, AAAA, CNAME, MX, NS, PTR, SOA, SRV, TXT,
             },
             Name, RData, Record, RecordType,
         },
+        serialize::binary::{BinDecoder, Restrict},
     },
     hickory_server::{
         authority::{MessageResponse, MessageResponseBuilder},
@@ -122,14 +123,15 @@ struct Args {
     #[arg(short, long, default_value = "127.0.0.1:16883")]
     listen: String,
 
+    /// whether to balance between servers
     #[arg(short, long, default_value_t = false)]
     rand: bool,
 
-    // use https
+    /// whether to use https
     #[arg(long, default_value_t = false)]
     https: bool,
 
-    // use http2
+    /// whether to use http2
     #[arg(long, default_value_t = false)]
     http2: bool,
 }
@@ -291,7 +293,9 @@ impl DnsProxy {
             | RecordType::NS
             | RecordType::SOA
             | RecordType::TXT
-            | RecordType::PTR => {
+            | RecordType::PTR
+            | RecordType::MX
+            | RecordType::SRV => {
                 let dns_entity = self
                     .get_dns_entity(
                         &quest.name().to_utf8(),
@@ -300,6 +304,9 @@ impl DnsProxy {
                     )
                     .await?;
                 if let Some(dns_entity) = dns_entity {
+                    if dns_entity.status.unwrap_or(1) != 0 {
+                        return Err(anyhow!("no such record"));
+                    }
                     if let Some(answer_list) = dns_entity.answer {
                         let mut answers: Vec<Record> = Vec::new();
                         let mut name_servers: Vec<Record> = Vec::new();
@@ -335,6 +342,33 @@ impl DnsProxy {
                                     RecordType::PTR,
                                     RData::PTR(PTR(Name::from_str(&answer.data)?)),
                                 ),
+                                15 => {
+                                    let parts: Vec<&str> = answer.data.split_whitespace().collect();
+                                    if parts.len() != 2 {
+                                        continue;
+                                    }
+                                    (
+                                        RecordType::MX,
+                                        RData::MX(MX::new(
+                                            parts[0].parse::<u16>().unwrap(),
+                                            Name::from_str(parts[1])?,
+                                        )),
+                                    )
+                                }
+                                33 => {
+                                    let parts: Vec<&str> = answer.data.split_whitespace().collect();
+                                    if parts.len() != 4 {
+                                        continue;
+                                    }
+                                    let priority = parts[0].parse::<u16>().unwrap();
+                                    let weight = parts[1].parse::<u16>().unwrap();
+                                    let port = parts[2].parse::<u16>().unwrap();
+                                    let target = Name::from_str(parts[3]).unwrap();
+                                    (
+                                        RecordType::SRV,
+                                        RData::SRV(SRV::new(priority, weight, port, target)),
+                                    )
+                                }
                                 16 => (RecordType::TXT, RData::TXT(TXT::new(vec![answer.data]))),
                                 28 => {
                                     (RecordType::AAAA, RData::AAAA(AAAA::from_str(&answer.data)?))
@@ -440,8 +474,8 @@ impl RequestHandler for DnsHandler {
                     }
                 }
             }
-            Err(e) => {
-                tracing::error!("Error handling request: {}", e);
+            Err(_) => {
+                // tracing::error!("Error handling request: {}", e);
                 DnsProxy::failure_response().unwrap()
             }
         }
